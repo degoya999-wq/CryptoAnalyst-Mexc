@@ -1,0 +1,5 @@
+ccxt>=4.4.0
+requests
+flask
+numpy
+aiohttp
