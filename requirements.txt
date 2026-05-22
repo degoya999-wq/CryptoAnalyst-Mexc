@@ -1,4 +1,0 @@
-ccxt
-requests
-flask
-numpy
