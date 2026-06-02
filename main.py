@@ -598,7 +598,7 @@ def _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode):
         f"👑 BTC за 4H: {btc_ch_4h:+.2f}%",
         "───────────────────",
         f"⏱ Горизонт: 2-5 дней",
-        f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>",
+        f"🔗 <a href='https://www.tradingview.com/chart/?symbol=BYBIT:{tv}'>TradingView</a>",
         f"📊 <a href='https://www.coinglass.com/tv/Binance_{coin}USDT'>CoinGlass СуперГрафик</a>",
     ]
 
@@ -633,7 +633,7 @@ CHAT_ID        = os.getenv("CHAT_ID")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     logging.warning("⚠️ TELEGRAM_TOKEN или CHAT_ID не заданы!")
 
-exchange = ccxt.mexc({
+exchange = ccxt.bybit({
     'enableRateLimit': True,
     'timeout': 15000,
     'options': {'defaultType': 'swap'}
@@ -660,11 +660,14 @@ SCORE_SIGNAL             = 7
 SCORE_ATTENTION          = 4
 SWING_ATTENTION_PCT      = 3.0
 
-SWING_BARS_4H            = 5           # окно для ранних сигналов (нативные 4H свечи)
+SWING_BARS_2H            = 5           # окно для ранних сигналов (нативные 2H свечи)
 
-# Пауза между монетами в 4H-скане сжатия. 550 монет × ~0.4с ≈ 220с на проход
-# fetch'ей; вместе с обработкой укладывается в 300с-цикл. Повышай при банах MEXC.
-SQUEEZE_SLEEP_4H         = 0.4
+# Пауза между монетами в 2H-скане сжатия. Сканируются ВСЕ perpetual Bybit
+# (~600 монет) × ~0.4с ≈ 240с на проход fetch'ей. ВНИМАНИЕ: вместе с 4H-сканом
+# и обработкой это может не уложиться в 300с-цикл — следи за временем итерации
+# в логах. Снижай паузу или увеличивай финальный sleep при «съезде» итераций.
+# Повышай паузу при появлении «Rate limit 2H» в логах Bybit.
+SQUEEZE_SLEEP_2H         = 0.4
 
 bot_status = {
     "started_at":       datetime.now().isoformat(),
@@ -1534,7 +1537,7 @@ def build_tv_link(symbol):
     base = symbol.split('/')[0]
     base_clean = _clean_ticker_for_chart(base)
     tv = f"{base_clean}USDT.P"
-    return f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>"
+    return f"🔗 <a href='https://www.tradingview.com/chart/?symbol=BYBIT:{tv}'>TradingView</a>"
 
 
 def build_coinglass_link(symbol):
@@ -2294,51 +2297,49 @@ def analyst_loop():
                     logging.error(f"Ошибка {symbol}: {e}")
 
             # ══════════════════════════════════════════════════
-            # 4H СКАН
+            # 2H СКАН (СЖАТИЕ + РАННИЕ ЛОНГ/ШОРТ)
             # ══════════════════════════════════════════════════
-            # СЖАТИЕ 4H: топ-550 активных монет, без фильтра объёма.
-            # Расширили до 550 чтобы захватывать монеты в зрелом сжатии,
-            # у которых объём 24h естественно проседает. На MEXC всего ~500-600
-            # пар USDT-perp, топ-550 даёт почти полный охват.
+            # Сканируем ВСЕ активные USDT-perpetual Bybit, без фильтра объёма
+            # (зрелое сжатие часто на просевшем объёме). Bybit отдаёт 2h нативно,
+            # склейка не нужна.
             #
-            # АНТИБАН: 550 монет × 1 fetch_ohlcv('4h') = 550 REST-запросов за
-            # итерацию. Между монетами стоит time.sleep(SQUEEZE_SLEEP_4H), чтобы
-            # не превысить лимиты MEXC. enableRateLimit=True страхует дополнительно.
+            # АНТИБАН: N монет × 1 fetch_ohlcv('2h') = N REST-запросов за итерацию.
+            # Между монетами стоит time.sleep(SQUEEZE_SLEEP_2H). Bybit лоялен к
+            # публичным market-data, enableRateLimit=True страхует дополнительно.
             #
-            # Внимание: на низколиквидных монетах ($5-50K) ATR Map даёт ложные
-            # срабатывания. Если будет много спама — вернуть фильтр объёма.
-            top550_4h = [x['s'] for x in vol_data[:550]]
+            # Внимание: на низколиквидных монетах ATR Map даёт ложные
+            # срабатывания. Если будет много спама — добавить фильтр объёма.
+            squeeze_symbols = [x['s'] for x in vol_data]
 
-            for symbol in top550_4h:
+            for symbol in squeeze_symbols:
                 try:
                     vol_24h_2h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
 
-                    # MEXC swap отдаёт 4h нативно (склейка не нужна — 2h
-                    # MEXC не отдавал, поэтому раньше клеили из 1h).
-                    # limit=120 → ~119 закрытых 4H, с запасом для ATR Map (50+).
-                    ohlcv_4h = None
+                    # Bybit swap отдаёт 2h нативно (склейка не нужна).
+                    # limit=120 → ~119 закрытых 2H, с запасом для ATR Map (50+).
+                    ohlcv_2h = None
                     for attempt in range(2):
                         try:
-                            ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=120); break
+                            ohlcv_2h = exchange.fetch_ohlcv(symbol, '2h', limit=120); break
                         except ccxt.NetworkError as e:
                             if attempt == 0: time.sleep(3)
                             else: raise
 
-                    if ohlcv_4h is None or len(ohlcv_4h) < 40:
+                    if ohlcv_2h is None or len(ohlcv_2h) < 40:
                         continue
 
-                    # Последняя свеча от MEXC — формирующаяся 4H (бот видит
+                    # Последняя свеча от Bybit — формирующаяся 2H (бот видит
                     # текущее движение внутри неё), остальные закрытые.
-                    closed_2h   = ohlcv_4h[:-1]
+                    closed_2h   = ohlcv_2h[:-1]
                     closes_2h   = [x[4] for x in closed_2h]
-                    current_2h  = ohlcv_4h[-1][4]
+                    current_2h  = ohlcv_2h[-1][4]
 
                     last_ts_2h  = closed_2h[-1][0]
-                    cid_2h      = last_ts_2h // 14_400_000   # 4H = 14_400_000 мс
+                    cid_2h      = last_ts_2h // 7_200_000   # 2H = 7_200_000 мс
 
-                    ib2_key_l = f"{symbol}_{cid_2h}_4h_ibl"
-                    ib2_key_s = f"{symbol}_{cid_2h}_4h_ibs"
-                    sq2_key   = f"{symbol}_{cid_2h}_4h_sq"
+                    ib2_key_l = f"{symbol}_{cid_2h}_2h_ibl"
+                    ib2_key_s = f"{symbol}_{cid_2h}_2h_ibs"
+                    sq2_key   = f"{symbol}_{cid_2h}_2h_sq"
 
                     if (ib2_key_l in sent_attention
                             and ib2_key_s in sent_attention
@@ -2349,7 +2350,7 @@ def analyst_loop():
                     v_hist_2h = [x[5] for x in closed_2h[-21:-1]]
                     v_avg_2h  = np.mean(v_hist_2h) if v_hist_2h else 1.0
 
-                    cur_2h         = ohlcv_4h[-1]
+                    cur_2h         = ohlcv_2h[-1]
                     ib_high_2h     = cur_2h[2]
                     ib_low_2h      = cur_2h[3]
                     ib_bounce_2h   = (current_2h - ib_low_2h)  / ib_low_2h  * 100 if ib_low_2h  > 0 else 0.0
@@ -2360,12 +2361,12 @@ def analyst_loop():
                     long_gate_2h  = ssma_allows_long(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
                     short_gate_2h = ssma_allows_short(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
 
-                    # ── swing_bars=5 на 4H ──────────────────
-                    # swing_bars=5 → окно 10 свечей 4H = 40 часов
+                    # ── swing_bars=5 на 2H ──────────────────
+                    # swing_bars=5 → окно 10 свечей 2H = 20 часов
                     # Уровни локальные → near_sl/sh срабатывает раньше
                     # → ранний лонг/шорт приходит до движения, не в момент
                     sw_lp_2h, sw_hp_2h, near_sl_2h, near_sh_2h, sw_l_2h, sw_h_2h = \
-                        calculate_swing_hilo(ohlcv_4h, swing_bars=SWING_BARS_4H)
+                        calculate_swing_hilo(ohlcv_2h, swing_bars=SWING_BARS_2H)
 
                     cvd_level_2h, _ = calc_cvd_level(closed_2h)
                     cvd_emoji_2h = {"bull":"🟢","bull_div":"🟢✨",
@@ -2379,7 +2380,7 @@ def analyst_loop():
 
                     atr_map_active = atr_map_forming
 
-                    cur_vol_2h_rel = (ohlcv_4h[-1][5] /
+                    cur_vol_2h_rel = (ohlcv_2h[-1][5] /
                         (sum(x[5] for x in closed_2h[-20:]) / 20)
                         if closed_2h else 1.0)
 
@@ -2406,15 +2407,15 @@ def analyst_loop():
                     ssma_lbl_2h = ""
                     if ssma_2h:
                         icon = "📈" if 'bull' in ssma_trend_2h else "📉"
-                        ssma_lbl_2h = f"{icon} SSMA 4H: {ssma_2h:.4g} ({ssma_slope_2h:+.2f}%/св)"
+                        ssma_lbl_2h = f"{icon} SSMA 2H: {ssma_2h:.4g} ({ssma_slope_2h:+.2f}%/св)"
 
                     tv = build_tv_link(symbol)
                     cg = build_coinglass_link(symbol)
                     btc_line = f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%"
-                    vol_line = f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M"
+                    vol_line = f"📦 Объём 22H: ${vol_24h_2h/1_000_000:.1f}M"
 
                     # ══════════════════════════════════════════════════
-                    # СЖАТИЕ 4H
+                    # СЖАТИЕ 2H
                     # is_sq → триггер по короткому окну (3 свечи)
                     # atr_map_active → триггер по длинному окну (компрессия 50+ свечей)
                     # Оба независимы и часто срабатывают на разных монетах.
@@ -2472,7 +2473,7 @@ def analyst_loop():
                             )
 
                         msg = "\n".join([
-                            f"🗜 <b>СЖАТИЕ 4H{wl_2h}</b>",
+                            f"🗜 <b>СЖАТИЕ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b>",
                             f"Цена: <code>{current_2h:.6g}</code>",
                             "───────────────────",
@@ -2480,8 +2481,8 @@ def analyst_loop():
                             sq_direction,
                             "───────────────────",
                             ssma_lbl_2h,
-                            f"{cvd_emoji_2h} CVD 4H: <b>{cvd_level_2h}</b>",
-                            f"📊 RSI 4H: {rsi_2h:.1f}",
+                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
+                            f"📊 RSI 2H: {rsi_2h:.1f}",
                             vol_line,
                             "───────────────────",
                             btc_line,
@@ -2491,15 +2492,15 @@ def analyst_loop():
                         if send_msg(msg):
                             sent_attention[sq2_key] = time.time()
                             bot_status["early_2h_sent"] += 1
-                            logging.info(f"СЖАТИЕ 4H: {symbol} is_sq={is_sq} atr_map={atr_map_score:.0f} ratio={sq_ratio:.2f}")
+                            logging.info(f"СЖАТИЕ 2H: {symbol} is_sq={is_sq} atr_map={atr_map_score:.0f} ratio={sq_ratio:.2f}")
 
                     # ══════════════════════════════════════════════════
-                    # РАННИЙ ЛОНГ 4H
+                    # РАННИЙ ЛОНГ 2H
                     # ИЗМЕНЕНИЕ 3: swing_bars=5 → near_sl_2h срабатывает
                     # раньше, на более локальных уровнях
                     # Объём остаётся MIN_VOLUME_ATTENTION = $1M
                     #
-                    # ФИЛЬТР RSI: если RSI 4H > 65 — перекуплено, лонг опасен.
+                    # ФИЛЬТР RSI: если RSI 2H > 65 — перекуплено, лонг опасен.
                     # 3-bar move фильтр НЕ применяется: разворот от капитуляционного
                     # лоя даёт большой move (+7-10%), но это валидный сигнал.
                     # ══════════════════════════════════════════════════
@@ -2511,34 +2512,34 @@ def analyst_loop():
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION
                             and rsi_2h <= 65):
                         parts = [
-                            f"⚡️ <b>РАННИЙ ЛОНГ 4H{wl_2h}</b>",
-                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 4H свечи",
+                            f"⚡️ <b>РАННИЙ ЛОНГ 2H{wl_2h}</b>",
+                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
                             f"Цена: <code>{current_2h:.6g}</code>",
                             f"Отскок от лоя: +{ib_bounce_2h:.1f}% | Объём: x{cur_vol_2h:.1f}",
-                            f"Swing Low 4H: +{sw_lp_2h:.1f}%",
+                            f"Swing Low 2H: +{sw_lp_2h:.1f}%",
                             "───────────────────",
                             ssma_lbl_2h,
-                            f"{cvd_emoji_2h} CVD 4H: <b>{cvd_level_2h}</b>",
-                            f"📊 RSI 4H: {rsi_2h:.1f}",
+                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
+                            f"📊 RSI 2H: {rsi_2h:.1f}",
                             vol_line,
                         ]
                         if is_sq:
                             parts.append(sq_label)
                         parts += [
                             "───────────────────",
-                            "⚠️ Свеча 4H не закрыта — ждите подтверждения",
+                            "⚠️ Свеча 2H не закрыта — ждите подтверждения",
                             btc_line, tv,
                             cg
                         ]
                         if send_msg("\n".join(parts)):
                             sent_attention[ib2_key_l] = time.time()
                             bot_status["early_2h_sent"] += 1
-                            logging.info(f"РАННИЙ ЛОНГ 4H: {symbol} bounce={ib_bounce_2h:.1f}% swing_bars={SWING_BARS_4H}")
+                            logging.info(f"РАННИЙ ЛОНГ 2H: {symbol} bounce={ib_bounce_2h:.1f}% swing_bars={SWING_BARS_2H}")
 
                     # ══════════════════════════════════════════════════
-                    # РАННИЙ ШОРТ 4H
+                    # РАННИЙ ШОРТ 2H
                     #
-                    # ФИЛЬТР RSI: если RSI 4H < 35 — перепродано, шорт опасен.
+                    # ФИЛЬТР RSI: если RSI 2H < 35 — перепродано, шорт опасен.
                     # 3-bar move фильтр НЕ применяется: разворот от пика после
                     # сильного памп-движения даёт большой move (-7-10%), но это
                     # валидный сигнал на шорт.
@@ -2551,49 +2552,49 @@ def analyst_loop():
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION
                             and rsi_2h >= 35):
                         parts = [
-                            f"⚡️ <b>РАННИЙ ШОРТ 4H{wl_2h}</b>",
-                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 4H свечи",
+                            f"⚡️ <b>РАННИЙ ШОРТ 2H{wl_2h}</b>",
+                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
                             f"Цена: <code>{current_2h:.6g}</code>",
                             f"Откат от хая: -{ib_pullback_2h:.1f}% | Объём: x{cur_vol_2h:.1f}",
-                            f"Swing High 4H: -{sw_hp_2h:.1f}%",
+                            f"Swing High 2H: -{sw_hp_2h:.1f}%",
                             "───────────────────",
                             ssma_lbl_2h,
-                            f"{cvd_emoji_2h} CVD 4H: <b>{cvd_level_2h}</b>",
-                            f"📊 RSI 4H: {rsi_2h:.1f}",
+                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
+                            f"📊 RSI 2H: {rsi_2h:.1f}",
                             vol_line,
                         ]
                         if is_sq:
                             parts.append(sq_label)
                         parts += [
                             "───────────────────",
-                            "⚠️ Свеча 4H не закрыта — ждите подтверждения",
+                            "⚠️ Свеча 2H не закрыта — ждите подтверждения",
                             btc_line, tv,
                             cg
                         ]
                         if send_msg("\n".join(parts)):
                             sent_attention[ib2_key_s] = time.time()
                             bot_status["early_2h_sent"] += 1
-                            logging.info(f"РАННИЙ ШОРТ 4H: {symbol} pullback={ib_pullback_2h:.1f}% swing_bars={SWING_BARS_4H}")
+                            logging.info(f"РАННИЙ ШОРТ 2H: {symbol} pullback={ib_pullback_2h:.1f}% swing_bars={SWING_BARS_2H}")
 
-                    # АНТИБАН: пауза между монетами при 550 REST-запросах
-                    time.sleep(SQUEEZE_SLEEP_4H)
+                    # АНТИБАН: пауза между монетами (скан всех perpetual Bybit)
+                    time.sleep(SQUEEZE_SLEEP_2H)
 
                 except ccxt.RateLimitExceeded:
-                    logging.warning(f"Rate limit 4H {symbol}, пауза 30с"); time.sleep(30)
+                    logging.warning(f"Rate limit 2H {symbol}, пауза 30с"); time.sleep(30)
                 except ccxt.NetworkError as e:
-                    logging.error(f"Network 4H {symbol}: {e}")
+                    logging.error(f"Network 2H {symbol}: {e}")
                 except Exception as e:
-                    logging.error(f"Ошибка 4H {symbol}: {e}")
+                    logging.error(f"Ошибка 2H {symbol}: {e}")
 
             now = time.time()
             sent_signals   = {k: v for k, v in sent_signals.items()   if now - v < 86400}
             sent_attention = {k: v for k, v in sent_attention.items() if now - v < 86400}
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
-            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 4H-sq: {len(top550_4h)} | "
+            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H-sq: {len(squeeze_symbols)} | "
                          f"Reversal: {bot_status['reversal_sent']} | "
                          f"Внимание: {bot_status['attention_sent']} | "
-                         f"Ранних 4H: {bot_status['early_2h_sent']} | "
+                         f"Ранних 2H: {bot_status['early_2h_sent']} | "
                          f"BTC vol: {ctx['btc_vol']:.2f}%")
             time.sleep(300)
 
@@ -2612,7 +2613,7 @@ def health():
             f"Ошибок: {bot_status['errors']}\n"
             f"Reversal 4H 🚨: {bot_status['reversal_sent']}\n"
             f"Внимание 🔔: {bot_status['attention_sent']}\n"
-            f"Ранних 4H: {bot_status['early_2h_sent']}\n"
+            f"Ранних 2H: {bot_status['early_2h_sent']}\n"
             f"Последняя итерация: {bot_status['last_iteration']}")
 
 
