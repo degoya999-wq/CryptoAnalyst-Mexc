@@ -1545,6 +1545,37 @@ def build_coinglass_link(symbol):
     return f"📊 <a href='https://www.coinglass.com/tv/Binance_{coin}USDT'>CoinGlass СуперГрафик</a>"
 
 
+def get_vol_7d_ratio(symbol, vol_24h):
+    """
+    Возвращает (avg_7d_usdt, ratio) — средний дневной оборот за 7 дней в USDT
+    и отношение текущего 24h-оборота к нему. ratio>1 = объём выше нормы.
+
+    Вызывать ТОЛЬКО в момент сигнала (не для всех монет в цикле): это
+    дополнительный REST-запрос дневных свечей на монету. На единичных сигналах
+    нагрузка незначительна и троттлинг не затрагивается.
+
+    При любой ошибке возвращает (None, None) — алерт всё равно уйдёт без 7d.
+    """
+    try:
+        daily = exchange.fetch_ohlcv(symbol, '1d', limit=8)
+        if not daily or len(daily) < 2:
+            return None, None
+        # последняя свеча — текущие неполные сутки, берём 7 закрытых до неё
+        closed_days = daily[:-1][-7:]
+        if not closed_days:
+            return None, None
+        # turnover в USDT = close * volume(base) по каждой дневной свече
+        turnovers = [c[4] * c[5] for c in closed_days if c[4] and c[5]]
+        if not turnovers:
+            return None, None
+        avg_7d = sum(turnovers) / len(turnovers)
+        ratio = (vol_24h / avg_7d) if avg_7d > 0 else None
+        return avg_7d, ratio
+    except Exception as e:
+        logging.warning(f"7d-объём {symbol}: {e}")
+        return None, None
+
+
 def send_msg(text):
     """
     Отправляет сообщение в Telegram.
@@ -1782,21 +1813,37 @@ def analyst_loop():
             ctx = get_market_context()
 
             try:
-                tickers = exchange.fetch_tickers()
+                # Bybit: явно linear-категория (USDT-перпы). Это и есть дефолт,
+                # но фиксируем во избежание неоднозначности при смене версии ccxt.
+                tickers = exchange.fetch_tickers(params={'category': 'linear'})
             except Exception as e:
                 logging.error(f"fetch_tickers: {e}"); time.sleep(60); continue
 
-            # Только USDT-пары: исключает дубликаты USDC-пар (XAUT/USDC:USDC и т.п.)
-            # и фильтрует низколиквидные альтернативные котировки.
+            # Только USDT-пары. quote=='USDT' для linear-перпов Bybit достаточно;
+            # фильтр по settle НЕ добавляем — ccxt не всегда его проставляет, и он
+            # может молча отсечь валидные пары.
             active_swaps = [s for s, m in exchange.markets.items()
                             if m.get('active')
                             and m.get('type') == 'swap'
                             and m.get('quote') == 'USDT']
 
+            # vol_data: пары с тикером — по реальному объёму; пары без тикера
+            # (новые/редкие) НЕ выкидываем молча, а добавляем с объёмом 0, чтобы
+            # они попали в скан сжатия (свечи дотянутся через fetch_ohlcv).
             vol_data = sorted(
-                [{'s': s, 'v': tickers[s].get('quoteVolume', 0)}
-                 for s in active_swaps if s in tickers],
+                [{'s': s, 'v': (tickers[s].get('quoteVolume', 0) or 0) if s in tickers else 0}
+                 for s in active_swaps],
                 key=lambda x: x['v'], reverse=True)
+
+            # ДИАГНОСТИКА ПОКРЫТИЯ: показывает, где теряются монеты.
+            # markets — все USDT-swap; tickers — сколько из них вернул fetch_tickers;
+            # nz — сколько с ненулевым объёмом (остальные уедут в конец списка).
+            _n_markets = len(active_swaps)
+            _n_in_tick = len([s for s in active_swaps if s in tickers])
+            _n_nonzero = len([x for x in vol_data if (x['v'] or 0) > 0])
+            logging.info(f"ПОКРЫТИЕ: USDT-swap в markets={_n_markets} | "
+                         f"есть в tickers={_n_in_tick} | с объёмом>0={_n_nonzero} | "
+                         f"в скане сжатия={len(vol_data)}")
 
             top100_4h = [x['s'] for x in vol_data[:100]]
             symbols   = list(dict.fromkeys(
@@ -1811,7 +1858,7 @@ def analyst_loop():
                     ohlcv = None
                     for attempt in range(2):
                         try:
-                            ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=120); break
+                            ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=100); break
                         except ccxt.NetworkError as e:
                             if attempt == 0: logging.warning(f"retry {symbol}: {e}"); time.sleep(3)
                             else: raise
@@ -2316,11 +2363,12 @@ def analyst_loop():
                     vol_24h_2h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
 
                     # Bybit swap отдаёт 2h нативно (склейка не нужна).
-                    # limit=120 → ~119 закрытых 2H, с запасом для ATR Map (50+).
+                    # limit=100 → ~99 закрытых 2H. Детекторам нужно max 60
+                    # (swing/SSMA); ATR Map baseline 50 — запас есть.
                     ohlcv_2h = None
                     for attempt in range(2):
                         try:
-                            ohlcv_2h = exchange.fetch_ohlcv(symbol, '2h', limit=120); break
+                            ohlcv_2h = exchange.fetch_ohlcv(symbol, '2h', limit=100); break
                         except ccxt.NetworkError as e:
                             if attempt == 0: time.sleep(3)
                             else: raise
@@ -2412,7 +2460,7 @@ def analyst_loop():
                     tv = build_tv_link(symbol)
                     cg = build_coinglass_link(symbol)
                     btc_line = f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%"
-                    vol_line = f"📦 Объём 22H: ${vol_24h_2h/1_000_000:.1f}M"
+                    vol_line = f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M"
 
                     # ══════════════════════════════════════════════════
                     # СЖАТИЕ 2H
@@ -2446,6 +2494,13 @@ def analyst_loop():
                     if (sq2_key not in sent_attention
                             and (is_sq or atr_map_active)
                             and (cur_vol_2h < 1.5 or atr_map_active)):
+
+                        # 7d-средний считаем только здесь — для монеты с реальным
+                        # сигналом (1 доп. запрос, не для всех 600 в цикле).
+                        _avg7d, _ratio7d = get_vol_7d_ratio(symbol, vol_24h_2h)
+                        if _ratio7d is not None:
+                            vol_line = (f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M "
+                                        f"(x{_ratio7d:.1f} от 7d-среднего)")
 
                         if ssma_trend_2h in ('bull_strong', 'bull_weak') and cvd_level_2h in ('bull', 'bull_div'):
                             sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈"
