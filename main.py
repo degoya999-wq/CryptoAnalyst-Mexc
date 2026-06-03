@@ -663,11 +663,10 @@ SWING_ATTENTION_PCT      = 3.0
 SWING_BARS_2H            = 5           # окно для ранних сигналов (нативные 2H свечи)
 
 # Пауза между монетами в 2H-скане сжатия. Сканируются ВСЕ perpetual Bybit
-# (~600 монет) × ~0.4с ≈ 240с на проход fetch'ей. ВНИМАНИЕ: вместе с 4H-сканом
-# и обработкой это может не уложиться в 300с-цикл — следи за временем итерации
-# в логах. Снижай паузу или увеличивай финальный sleep при «съезде» итераций.
-# Повышай паузу при появлении «Rate limit 2H» в логах Bybit.
-SQUEEZE_SLEEP_2H         = 0.4
+# (~600 монет). При 0.4с Bybit начинал троттлить ("Rate limit 2H"), что
+# приводило к SKIP монеты и пропуску сигнала. 0.6с ≈ 1.6 req/s — заметно ниже
+# лимита. Если троттлинг останется — поднимай до 0.8–1.0.
+SQUEEZE_SLEEP_2H         = 0.6
 
 bot_status = {
     "started_at":       datetime.now().isoformat(),
@@ -2580,7 +2579,11 @@ def analyst_loop():
                     time.sleep(SQUEEZE_SLEEP_2H)
 
                 except ccxt.RateLimitExceeded:
-                    logging.warning(f"Rate limit 2H {symbol}, пауза 30с"); time.sleep(30)
+                    # Bybit-лимит — скользящее окно в секунду; 10с с запасом
+                    # на сброс. Монета НЕ теряется навсегда: на следующей итерации
+                    # (через цикл) она обработается снова. cid_2h тот же 2 часа,
+                    # поэтому повторный сигнал по уже отправленной монете не уйдёт.
+                    logging.warning(f"Rate limit 2H {symbol}, пауза 10с"); time.sleep(10)
                 except ccxt.NetworkError as e:
                     logging.error(f"Network 2H {symbol}: {e}")
                 except Exception as e:
@@ -2596,7 +2599,11 @@ def analyst_loop():
                          f"Внимание: {bot_status['attention_sent']} | "
                          f"Ранних 2H: {bot_status['early_2h_sent']} | "
                          f"BTC vol: {ctx['btc_vol']:.2f}%")
-            time.sleep(300)
+            # Полный проход по ~600 монотам при паузе 0.6с уже занимает ~6 мин —
+            # это и есть основной интервал между сканами. Финальный буфер делаем
+            # коротким, иначе между итерациями будет лишний простой. Если в логах
+            # видно, что итерация длится <5 мин — можно вернуть к 120-180с.
+            time.sleep(60)
 
         except ccxt.NetworkError as e:
             logging.error(f"Глобальная сеть: {e}"); bot_status["errors"] += 1; time.sleep(60)
